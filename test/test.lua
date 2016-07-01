@@ -282,36 +282,37 @@ function dpnntest.Module_type()
       mytester:assertTensorEq(gradParams[i], gradParams2[i], 0.00001, " gradParams err "..i)
    end
    
+   local input = torch.randn(3,32,32)
+   local cnn = nn.Sequential()
+   cnn:add(nn.SpatialConvolution(3,8,5,5))
+   cnn:add(nn.ReLU())
+   cnn:add(nn.SpatialAveragePooling(2,2,2,2))
+   cnn:add(nn.SpatialConvolution(8,12,5,5))
+   cnn:add(nn.ReLU())
+   cnn:add(nn.SpatialAveragePooling(2,2,2,2))
+   local outsize = cnn:outside{1,3,32,32}
+   cnn:add(nn.Collapse(3))
+   cnn:add(nn.Linear(outsize[2]*outsize[3]*outsize[4],20))
+   cnn:add(nn.ReLU())
+   cnn:add(nn.Linear(20,10))
+   local output = cnn:forward(input):clone()
+   local gradOutput = output:clone()
+   local gradInput = cnn:backward(input, gradOutput):clone()
+   cnn:float()
+   local input3 = input:float()
+   local output3 = cnn:forward(input3):clone()
+   local gradOutput3 = output3:clone()
+   local gradInput3 = cnn:backward(input3, gradOutput3):clone()
+   local o1, o2 = output3:float(), output:float()
+   mytester:assertTensorEq(o1, o2, 0.000001)
+   mytester:assertTensorEq(gradInput3:float(), gradInput:float(), 0.00001, "type float bwd err") 
    if pcall(function() require 'cunn' end) then
-      local input = torch.randn(3,32,32)
-      local cnn = nn.Sequential()
-      cnn:add(nn.SpatialConvolutionMM(3,8,5,5))
-      cnn:add(nn.ReLU())
-      cnn:add(nn.SpatialAveragePooling(2,2,2,2))
-      cnn:add(nn.SpatialConvolutionMM(8,12,5,5))
-      cnn:add(nn.ReLU())
-      cnn:add(nn.SpatialAveragePooling(2,2,2,2))
-      local outsize = cnn:outside{1,3,32,32}
-      cnn:add(nn.Collapse(3))
-      cnn:add(nn.Linear(outsize[2]*outsize[3]*outsize[4],20))
-      cnn:add(nn.ReLU())
-      cnn:add(nn.Linear(20,10))
-      local output = cnn:forward(input):clone()
-      local gradOutput = output:clone()
-      local gradInput = cnn:backward(input, gradOutput):clone()
-      cnn:float()
-      local input3 = input:float()
-      local output3 = cnn:forward(input3):clone()
-      local gradOutput3 = output3:clone()
-      local gradInput3 = cnn:backward(input3, gradOutput3):clone()
-      mytester:assertTensorEq(output3:float(), output:float(), 0.000001, "type float fwd err")
-      mytester:assertTensorEq(gradInput3:float(), gradInput:float(), 0.00001, "type float bwd err") 
       cnn:cuda()
       local input2 = input3:cuda()
       local gradOutput2 = gradOutput3:cuda()
       local output2 = cnn:forward(input2)
       local gradInput2 = cnn:backward(input2, gradOutput2)
-      mytester:assertTensorEq(output2:float(), output3, 0.000001, "type cuda fwd err")
+      mytester:assertTensorEq(output2:float(), output3, 0.000001)
       mytester:assertTensorEq(gradInput2:float(), gradInput3, 0.00001, "type cuda bwd err") 
    end
 end
@@ -470,7 +471,7 @@ function dpnntest.Collapse()
    mytester:assertTableEq(gradInput:size():totable(), input:size():totable(), 0.000001, "Collapse:backward size")
    local input2 = input:transpose(1,4)
    local output2 = c:forward(input2)
-   mytester:assertTensorEq(input2, output2, 0.000001, "Collapse:forward non-contiguous")
+   mytester:assertTensorEq(input2:contiguous():view(5,-1), output2, 0.000001, "Collapse:forward non-contiguous")
    local gradInput2 = c:backward(input2, output2)
    mytester:assertTensorEq(gradInput2, input2, 0.000001, "Collapse:backward non-contiguous")
    mytester:assertTableEq(gradInput2:size():totable(), input2:size():totable(), 0.000001, "Collapse:backward size non-contiguous")
@@ -769,6 +770,47 @@ function dpnntest.ReinforceNormal()
    local reward2 = reward:view(4,1):expandAs(gradStdev)
    gradStdev:cmul(reward2):mul(-1)
    mytester:assertTensorEq(gradInput[2], gradStdev, 0.000001, "ReinforceNormal backward table input - gradStdev err")
+end
+
+function dpnntest.ReinforceGamma()
+   require 'randomkit'
+   require 'cephes'
+   local input = torch.rand(500,1000):fill(250) -- shapes
+   local gradOutput = torch.Tensor() -- will be ignored
+   local reward = torch.randn(500)
+   -- test scalar scale
+   local scale = 2
+   local rn = nn.ReinforceGamma(scale)
+   local output = rn:forward(input)
+   mytester:assert(input:isSameSizeAs(output), "ReinforceGamma forward size err")
+   local outmean = torch.mean(output)
+   -- expected value of distribution is shape*scale
+   local err = math.abs(outmean - torch.mean(torch.mul(input,scale)))
+   mytester:assert(err < 0.1, "ReinforceGamma forward mean err")
+   rn:reinforce(reward)
+   local gradInput = rn:updateGradInput(input, gradOutput)
+   local gradInput2 = torch.log(output:clone())
+   gradInput2:add(-1, cephes.digamma(input))
+   gradInput2:add(-1*torch.log(scale) )
+   local reward2 = reward:view(500,1):expandAs(input)
+   gradInput2:cmul(reward2):mul(-1)
+   mytester:assertTensorEq(gradInput2, gradInput, 0.00001, "ReinforceGamma backward err")
+   -- test input {mean, stdev}
+   local shape, scale = torch.rand(4,10), torch.rand(4,10)
+   local input = {shape, scale}
+   local rn = nn.ReinforceGamma()
+   local output = rn:updateOutput(input)
+   local reward = torch.randn(4)
+   rn:reinforce(reward)
+   local gradInput = rn:backward(input, gradOutput)
+   mytester:assert(shape:isSameSizeAs(output), "ReinforceGamma forward table input - output size err")
+   mytester:assert(gradInput[1]:isSameSizeAs(shape), "ReinforceGamma backward table input - mean size err")
+   mytester:assert(gradInput[2]:isSameSizeAs(scale), "ReinforceGamma backward table input - stdev size err")
+   local gradScale = torch.cdiv(output:clone(), torch.pow(scale,2) )
+   gradScale:add( -1, torch.cdiv( shape, scale) )
+   local reward2 = reward:view(4,1):expandAs(gradScale)
+   gradScale:cmul(reward2):mul(-1)
+   mytester:assertTensorEq(gradInput[2], gradScale, 0.000001, "ReinforceGamma backward table input - gradStdev err")
 end
 
 function dpnntest.ReinforceBernoulli()
@@ -1574,7 +1616,6 @@ function dpnntest.TotalDropout()
 end
 
 function dpnnbigtest.Reinforce()
-   error"this needs to be updated with new VRClassReward interface"
    -- let us try to reinforce an mlp to learn a simple distribution
    local n = 10
    local inputs = torch.Tensor(n,3):uniform(0,0.1)
@@ -1629,13 +1670,15 @@ function dpnnbigtest.Reinforce()
             end
             reward = reward/inputs:size(1)
             
-            if reward*0.7 >= baseReward then
+            -- is the baseReward lesser than 70% of reward after training?
+            -- i.e. did the reward increase sufficiently?
+            if reward*0.7 > baseReward then
                converged = true
                break
             end
          end
          
-         if reward*0.7 >= baseReward then
+         if reward*0.7 > baseReward then
             converged = true
             break
          end
@@ -1654,11 +1697,33 @@ function dpnnbigtest.Reinforce()
    mlp:add(nn.Clip(-1,1))
    mlp:add(nn.Linear(hiddenSize, inputs:size(2)))
    mlp:add(nn.SoftMax())
+
+   local concat = nn.ConcatTable()
+   concat:add(mlp)
+   concat:add( nn.Sequential():add( nn.Constant(1,1) ):add(nn.Add(1)) )
    
-   local cost = nn.VRClassReward(mlp, beta, alpha)
+   local cost = nn.VRClassReward(concat, alpha)
    
-   train(mlp, cost, N, 'ReinforceNormal')
+   train(concat, cost, N, 'ReinforceNormal')
    
+   -- ReinforceGamma
+   local hiddenSize = 200
+   local N = 10
+   local mlp = nn.Sequential()
+   mlp:add(nn.Linear(inputs:size(2),hiddenSize))
+   mlp:add(nn.Sigmoid())
+   mlp:add(nn.ReinforceGamma(stdev))
+   mlp:add(nn.Linear(hiddenSize, inputs:size(2)))
+   mlp:add(nn.SoftMax())
+   
+   local concat = nn.ConcatTable()
+   concat:add(mlp)
+   concat:add( nn.Sequential():add( nn.Constant(1,1) ):add(nn.Add(1)) )
+   
+   local cost = nn.VRClassReward(concat, alpha)
+   
+   train(concat, cost, N, 'ReinforceGamma')
+
    -- ReinforceBernoulli
    local hiddenSize = 20
    local N = 30
@@ -1669,9 +1734,13 @@ function dpnnbigtest.Reinforce()
    mlp:add(nn.Linear(hiddenSize, inputs:size(2)))
    mlp:add(nn.SoftMax())
    
-   local cost = nn.VRClassReward(mlp, beta, alpha)
+   local concat = nn.ConcatTable()
+   concat:add(mlp)
+   concat:add( nn.Sequential():add( nn.Constant(1,1) ):add(nn.Add(1)) )
    
-   train(mlp, cost, N, 'ReinforceBernoulli')
+   local cost = nn.VRClassReward(concat, alpha)
+   
+   train(concat, cost, N, 'ReinforceBernoulli')
    
    -- ReinforceCategorical
    local hiddenSize = 200
@@ -1684,9 +1753,13 @@ function dpnnbigtest.Reinforce()
    mlp:add(nn.AddConstant(0.00001))
    mlp:add(nn.ReinforceCategorical())
    
-   local cost = nn.VRClassReward(mlp, beta, alpha)
+   local concat = nn.ConcatTable()
+   concat:add(mlp)
+   concat:add( nn.Sequential():add( nn.Constant(1,1) ):add(nn.Add(1)) )
    
-   train(mlp, cost, N, 'ReinforceCategorical')
+   local cost = nn.VRClassReward(concat, alpha)
+   
+   train(concat, cost, N, 'ReinforceCategorical')
 end
 
 -- Unit Test WhiteNoise
@@ -1855,6 +1928,86 @@ function dpnntest.SpatialRegionDropout()
    end
 end
 
+-- Unit Test SpatialBinaryConvolution
+function dpnntest.SpatialBinaryConvolution()
+   local hasCuda = pcall(function() require 'cunn' end)
+   local useCudas = {false, hasCuda}
+   local nInputPlane = 3
+   local nOutputPlane = 16
+   local kW = 3
+   local kH = 3
+   local height = 224
+   local width = 224
+
+   local model = nn.SpatialBinaryConvolution(nInputPlane, nOutputPlane,
+                                             kW, kH)
+   local input = torch.rand(nInputPlane, height, width)
+
+   for _, useCuda in pairs(useCudas) do
+      if useCuda then
+         model:cuda()
+         input = input:cuda()
+      end
+      model:zeroGradParameters()
+      local output = model:forward(input)
+      local gradInput = model:backward(input, output)
+   end
+end
+
+-- Unit Test SimpleColorTransform
+function dpnntest.SimpleColorTransform()
+   local hasCuda = pcall(function() require 'cunn' end)
+   local useCudas = {false, hasCuda}
+   local value = 10
+   local rangeValue = 2
+   local precision = rangeValue*0.1
+   local range = torch.zeros(3):fill(rangeValue)
+   local model = nn.SimpleColorTransform(3, range)
+   local input = torch.zeros(32, 3, 100, 100):fill(value)
+
+   for _, useCuda in pairs(useCudas) do
+      if useCuda then
+         model:cuda()
+         input = input:cuda()
+      end
+      local output = model:forward(input)
+      mytester:assert(output:std() <= rangeValue+precision,
+                       "SimpleColorTransform output value incorrect.")
+      local gradInput = model:backward(input, input)
+      mytester:assert(gradInput:sum() == input:sum(),
+                       "SimpleColorTransform gradInput value incorrect.")
+   end
+end
+
+-- Unit Test PCAColorTransform
+function dpnntest.PCAColorTransform()
+   local hasCuda = pcall(function() require 'cunn' end)
+   local useCudas = {false, hasCuda}
+   local std = 0.1
+   local value = 145
+   local rangeValue = 1800
+   local precision = rangeValue * 3 * std
+   local eigenVectors = torch.Tensor({{ 0.58786434,  0.56388045,  0.58004685},
+                                      {-0.65427388, -0.0902746 ,  0.75085031},
+                                      {-0.47575331,  0.82090763, -0.31586303}})
+   local eigenValues = torch.Tensor({4491.21, 722.85, 68.07})
+   local model = nn.PCAColorTransform(3, eigenVectors, eigenValues, std)
+   local input = torch.zeros(32, 3, 100, 100):fill(value)
+
+   for _, useCuda in pairs(useCudas) do
+      if useCuda then
+         model:cuda()
+         input = input:cuda()
+      end
+      local output = model:forward(input)
+      mytester:assert(output:std() <= rangeValue+precision,
+                       "PCAColorTransform output value incorrect.")
+      local gradInput = model:backward(input, input)
+      mytester:assert(gradInput:sum() == input:sum(),
+                       "PCAColorTransform gradInput value incorrect.")
+   end
+end
+
 -- Unit Test Kmeans layer
 function dpnnbigtest.Kmeans()
    local k = 10
@@ -1940,8 +2093,32 @@ function dpnntest.FireModule()
             input = input:cuda()
          end
          local output = model:forward(input)
-         local gradInput = model:forward(input, output)
+         local gradInput = model:backward(input, output)
       end
+   end
+end
+
+-- Unit Test SpatialFeatNormalization
+function dpnntest.SpatialFeatNormalization()
+   local hasCuda = pcall(function() require 'cunn' end)
+   local useCudas = {false, hasCuda}
+   local input = torch.zeros(3, 32, 32):fill(2)
+   local mean = torch.zeros(3):fill(1)
+   local std = torch.zeros(3):fill(0.5)
+   local outputValue = 2
+   local gradValue = 4
+   for _, useCuda in pairs(useCudas) do
+      local model = nn.SpatialFeatNormalization(mean, std)
+      if useCuda then
+         model:cuda()
+         input = input:cuda()
+      end
+      local output = model:forward(input)
+      local gradInput = model:backward(input, output)
+      mytester:assert( output:mean() == outputValue,
+                     "SpatialFeatNormalization forward mean value incorrect.")
+      mytester:assert( gradInput:mean() == gradValue,
+                     "SpatialFeatNormalization backward mean value incorrect.")
    end
 end
 
@@ -1961,6 +2138,12 @@ function dpnntest.OneHot()
    output2:index(eye, 1, input)
    mytester:assertTensorEq(output, output2, 0.000001, "OneHot forward batch err")
    mytester:assert(output:dim() == 2)
+
+   -- non-batch mode (number input)
+   local num = 3
+   local output3 = torch.zeros(nClass)
+   output3[num] = 1.0
+   mytester:assertTensorEq(oh:forward(num), output3, 0.000001, "OneHot forward number err")
 
    local gradInput = oh:backward(input, gradOutput)
    mytester:assertTensorEq(gradInput, input:double():zero(), 0.000001, "OneHot backward batch err")
@@ -1984,6 +2167,9 @@ function dpnntest.OneHot()
       local gradInput2 = oh:backward(input, gradOutput)
       mytester:assertTensorEq(gradInput, gradInput2:double(), 0.000001, "OneHot backward batch err")
       cutorch.synchronize()
+
+      -- non-batch mode (number input)
+      mytester:assertTensorEq(oh:forward(num), output3:cuda(), 0.000001, "OneHot forward number err")
    end
    
    -- multi-dimensional input
@@ -2049,6 +2235,406 @@ function dpnntest.OneHot()
          print("Onehot GPU vs CPU time", gputime, cputime)
       end
    end
+end
+
+function dpnntest.NCE()
+   local batchsize = 4
+   local k = 10
+   local inputsize = 3
+   local outputsize = 100
+   
+   local noise = torch.Tensor(outputsize):random(1,100)
+   
+   local ncem = nn.NCEModule(inputsize, outputsize, k, noise)
+   local ncec = nn.NCECriterion()
+   
+   local input = torch.randn(batchsize, inputsize)
+   local target = torch.LongTensor(batchsize):random(1,outputsize)
+   local inputTable = {input, target}
+   
+   -- test training 
+   
+   -- NCEModule.forward
+   local output = ncem:forward(inputTable)
+   
+   mytester:assert(torch.type(output) == 'table')
+   mytester:assert(#output == 4)
+   
+   local Pmt, Pms, Pnt, Pns = unpack(output)
+   
+   mytester:assertTableEq(Pmt:size():totable(), {batchsize}, 0.0000001)
+   mytester:assertTableEq(Pms:size():totable(), {batchsize, k}, 0.0000001)
+   mytester:assertTableEq(Pnt:size():totable(), {batchsize}, 0.0000001)
+   mytester:assertTableEq(Pns:size():totable(), {batchsize, k}, 0.0000001)
+   
+   mytester:assert(ncem.sampleidx:min() >= 1 and ncem.sampleidx:max() <= outputsize)
+   
+   local sampleprob2 = noise:index(1, ncem.sampleidx:view(-1)):view(batchsize, k+1)
+   mytester:assertTensorEq(sampleprob2:select(2,1), Pnt, 0.0000001)
+   mytester:assertTensorEq(sampleprob2:narrow(2,2,k), Pns, 0.0000001)
+   
+   local linear = nn.Linear(inputsize, outputsize)
+   linear.weight:copy(ncem.weight)
+   linear.bias:copy(ncem.bias)
+   local mlp = nn.Sequential():add(linear):add(nn.Exp()):add(nn.MulConstant(1/ncem.Z[1]))
+
+   local output2_ = mlp:forward(input)
+   local output2 = torch.Tensor(batchsize, k+1)
+   for i=1,batchsize do
+      output2[i]:index(output2_[i],1,ncem.sampleidx[i])
+   end
+   local Pmt2 = output2:select(2,1)
+   local Pms2 = output2:narrow(2,2,k)
+   
+   mytester:assertTensorEq(Pmt, Pmt2, 0.000001)
+   mytester:assertTensorEq(Pms, Pms2, 0.000001)
+   
+   -- NCECriterion.forward
+   local loss = ncec:forward(output, target)
+   
+   -- eq 5.1 : P(origin=model) = Pmt / (Pmt + k*Pnt) 
+   local Pom = Pmt:clone()
+   local mdiv = Pmt:clone():add(k, Pnt):add(0.0000001)
+   Pom:cdiv(mdiv)
+   
+   -- eq 5.2 : P(origin=noise) = k*Pns / (Pms + k*Pns)
+   local Pon = Pns:clone():mul(k)
+   local ndiv = Pms:clone():add(k, Pns):add(0.0000001)
+   Pon:cdiv(ndiv)
+   
+   -- equation 6 in ref. A
+   
+   local lossm = torch.log(Pom):sum()
+   local lossn = torch.log(Pon):sum()
+   
+   local loss2 = - (lossm + lossn)/batchsize
+   
+   mytester:assert(math.abs(loss - loss2) < 0.000001)
+   
+   -- NCECriterion.backward
+   local gradOutput = ncec:backward(output, target)
+   
+   mytester:assert(#gradOutput == 4)
+   mytester:assert(math.abs(gradOutput[3]:sum()) < 0.0000001)
+   mytester:assert(math.abs(gradOutput[4]:sum()) < 0.0000001)
+   
+   local dPmt, dPms = gradOutput[1], gradOutput[2]
+   
+   -- d Pmt / d input = -k*Pnt / ( Pmt * (Pmt + k*Pnt) )
+   local dPmt2 = torch.mul(Pnt, -k):cdiv(mdiv):cdiv(torch.add(Pmt, 0.0000001)):div(batchsize)
+   -- d Pms / d input = Pms / ( Pms * (Pms + k*Pns) )
+   local dPms2 = Pms:clone():cdiv(ndiv):cdiv(torch.add(Pms, 0.0000001)):div(batchsize)
+   
+   mytester:assertTensorEq(dPmt, dPmt2, 0.0000001)
+   mytester:assertTensorEq(dPms, dPms2, 0.0000001)
+   
+   mytester:assert(dPmt:sum() == dPmt:sum())
+   mytester:assert(dPms:sum() == dPms:sum())
+   
+   -- NCEModule.backward
+   ncem:zeroGradParameters()
+   local gradInput = ncem:backward(inputTable, gradOutput)
+   
+   -- updateGradInput
+   local gradOutput2_ = torch.zeros(batchsize, k+1)
+   gradOutput2_:select(2,1):copy(gradOutput[1])
+   gradOutput2_:narrow(2,2,k):copy(gradOutput[2])
+   local gradOutput2 = torch.zeros(batchsize, outputsize)
+   for i=1,batchsize do
+      gradOutput2[i]:indexAdd(1, ncem.sampleidx[i], gradOutput2_[i])
+   end
+   mlp:zeroGradParameters()
+   local gradInput2 = mlp:backward(input, gradOutput2)
+   mytester:assertTensorEq(gradInput[1], gradInput2, 0.0000001)
+   
+   -- accGradParameters
+   
+   local params, gradParams = ncem:parameters()
+   local params2, gradParams2 = mlp:parameters()
+   
+   for i=1,#params do
+      mytester:assertTensorEq(gradParams[i], gradParams2[i], 0.0000001)
+   end
+   
+   
+   if pcall(function() require 'cunn' end) then
+      -- test training with cuda 
+   
+      ncem:cuda()
+      ncec:cuda()
+      
+      local input = input:cuda()
+      local target = target:cuda()
+      
+      local inputTable = {input, target}
+      
+      -- NCEModule.forward
+      local output = ncem:forward(inputTable)
+      
+      mytester:assert(torch.type(output) == 'table')
+      mytester:assert(#output == 4)
+      
+      local Pmt, Pms, Pnt, Pns = unpack(output)
+      
+      mytester:assertTableEq(Pmt:size():totable(), {batchsize}, 0.0000001)
+      mytester:assertTableEq(Pms:size():totable(), {batchsize, k}, 0.0000001)
+      mytester:assertTableEq(Pnt:size():totable(), {batchsize}, 0.0000001)
+      mytester:assertTableEq(Pns:size():totable(), {batchsize, k}, 0.0000001)
+      
+      mytester:assert(ncem.sampleidx:min() >= 1 and ncem.sampleidx:max() <= outputsize)
+      
+      local sampleprob2 = noise:cuda():index(1, ncem.sampleidx:view(-1)):view(batchsize, k+1)
+      
+      mytester:assertTensorEq(sampleprob2:select(2,1), Pnt, 0.0000001)
+      mytester:assertTensorEq(sampleprob2:narrow(2,2,k), Pns, 0.0000001)
+      
+      local linear = nn.Linear(inputsize, outputsize)
+      linear.weight:copy(ncem.weight)
+      linear.bias:copy(ncem.bias)
+      local mlp = nn.Sequential():add(linear):add(nn.Exp())
+      mlp:cuda()
+
+      local output2_ = mlp:forward(input)
+      local output2 = torch.CudaTensor(batchsize, k+1)
+      for i=1,batchsize do
+         output2[i]:index(output2_[i],1,ncem.sampleidx[i])
+      end
+      local Pmt2 = output2:select(2,1)
+      local Pms2 = output2:narrow(2,2,k)
+      
+      mytester:assertTensorEq(Pmt, Pmt2, 0.000001)
+      mytester:assertTensorEq(Pms, Pms2, 0.000001)
+      
+      -- NCECriterion.forward
+      local loss = ncec:forward(output, target)
+      
+      -- eq 5.1 : P(origin=model) = Pmt / (Pmt + k*Pnt) 
+      local Pom = Pmt:clone()
+      local mdiv = Pmt:clone():add(k, Pnt):add(0.0000001)
+      Pom:cdiv(mdiv)
+      
+      -- eq 5.2 : P(origin=noise) = k*Pns / (Pms + k*Pns)
+      local Pon = Pns:clone():mul(k)
+      local ndiv = Pms:clone():add(k, Pns):add(0.0000001)
+      Pon:cdiv(ndiv)
+      
+      -- equation 6 in ref. A
+      
+      local lossm = torch.log(Pom):sum()
+      local lossn = torch.log(Pon):sum()
+      
+      local loss2 = - (lossm + lossn)/batchsize
+      
+      mytester:assert(math.abs(loss - loss2) < 0.000001)
+      
+      -- NCECriterion.backward
+      local gradOutput = ncec:backward(output, target)
+      
+      mytester:assert(#gradOutput == 4)
+      mytester:assert(math.abs(gradOutput[3]:sum()) < 0.0000001)
+      mytester:assert(math.abs(gradOutput[4]:sum()) < 0.0000001)
+      
+      local dPmt, dPms = gradOutput[1], gradOutput[2]
+      
+      -- d Pmt / d input = -k*Pnt / ( Pmt * (Pmt + k*Pnt) )
+      local dPmt2 = torch.mul(Pnt, -k):cdiv(mdiv):cdiv(torch.add(Pmt, 0.0000001)):div(batchsize)
+      -- d Pms / d input = Pms / ( Pms * (Pms + k*Pns) )
+      local dPms2 = Pms:clone():cdiv(ndiv):cdiv(torch.add(Pms, 0.0000001)):div(batchsize)
+      
+      mytester:assertTensorEq(dPmt, dPmt2, 0.0000001)
+      mytester:assertTensorEq(dPms, dPms2, 0.0000001)
+      
+      mytester:assert(dPmt:sum() == dPmt:sum())
+      mytester:assert(dPms:sum() == dPms:sum())
+      
+      -- NCEModule.backward
+      ncem:zeroGradParameters()
+      local gradInput = ncem:backward(inputTable, gradOutput)
+      
+      -- updateGradInput
+      local gradOutput2_ = torch.zeros(batchsize, k+1):cuda()
+      gradOutput2_:select(2,1):copy(gradOutput[1])
+      gradOutput2_:narrow(2,2,k):copy(gradOutput[2])
+      local gradOutput2 = torch.zeros(batchsize, outputsize):cuda()
+      for i=1,batchsize do
+         gradOutput2[i]:indexAdd(1, ncem.sampleidx[i], gradOutput2_[i])
+      end
+      mlp:zeroGradParameters()
+      local gradInput2 = mlp:backward(input, gradOutput2)
+      mytester:assertTensorEq(gradInput[1], gradInput2, 0.0000001)
+      
+      -- accGradParameters
+      
+      local params, gradParams = ncem:parameters()
+      local params2, gradParams2 = mlp:parameters()
+      
+      for i=1,#params do
+         mytester:assertTensorEq(gradParams[i], gradParams2[i], 0.0000001)
+      end
+   end
+end
+
+function dpnntest.NCE_multinomial()
+   local probs = torch.Tensor(10):uniform(0,1)
+   probs:div(probs:sum())
+   local nce = nn.NCEModule(10, 10, 2500, probs)
+   
+   local output = torch.LongTensor()
+   nce:noiseSample(output, 1000, 2500)
+   
+   local counts = torch.Tensor(10):zero()
+   output:apply(function(x)
+      counts[x] = counts[x] + 1
+   end)
+   
+   counts:div(counts:sum())
+   
+   mytester:assertTensorEq(probs, counts, 0.001)
+end
+
+function dpnnbigtest.NCE_benchmark()
+   local nclass = 1000000
+   local hiddensize = 200
+   local batchsize = 50
+   local nloop = 5
+   local k = 25
+   local unigrams = torch.Tensor(nclass):uniform(0,1)
+   local mlp = nn.Sequential()
+      :add(nn.Linear(hiddensize, nclass))
+      :add(nn.SoftMax())
+   local nll = nn.ClassNLLCriterion()
+   
+   local nce = nn.NCEModule(hiddensize, nclass, 25, unigrams)
+   local crit = nn.NCECriterion()
+   
+   local input = torch.randn(batchsize, hiddensize)
+   local target = torch.LongTensor(batchsize):random(1,nclass)
+   
+   local sync = function() return end
+   if pcall(function() require 'cunn' end) then
+      input = input:cuda()
+      target = target:cuda()
+      nce:cuda()
+      crit:cuda()
+      mlp:cuda()
+      nll:cuda()
+      sync = function() cutorch.synchronize() end
+   end
+   
+   print(torch.type(nce.unigrams))
+   
+   local output = nce:forward{input, target}
+   local loss = crit:forward(output, target)
+   local gradOutput = crit:backward(output, target)
+   local gradInput = nce:backward({input, target}, gradOutput)
+   
+   local output = mlp:forward(input)
+   local loss = nll:forward(output, target)
+   local gradOutput = nll:backward(output, target)
+   local gradInput = mlp:backward(input, gradOutput)
+   sync()
+   
+   local a = torch.Timer()
+   for i=1,nloop do
+      output = nce:forward{input, target}
+   end
+   sync()
+   local ncefwd = a:time().real
+   
+   a:reset()
+   for i=1,nloop do
+      loss = crit:forward(output, target)
+   end
+   sync()
+   local critfwd = a:time().real
+   
+   a:reset()
+   for i=1,nloop do
+      gradOutput = crit:backward(output, target)
+   end
+   sync()
+   local critbwd = a:time().real
+   
+   a:reset()
+   for i=1,nloop do
+      gradInput = nce:backward({input, target}, gradOutput)
+   end
+   sync()
+   local ncebwd = a:time().real
+   
+   -- mlp nll
+   
+   local a = torch.Timer()
+   for i=1,nloop do
+      output = mlp:forward(input)
+   end
+   sync()
+   local mlpfwd = a:time().real
+   
+   a:reset()
+   for i=1,nloop do
+      loss = nll:forward(output, target)
+   end
+   sync()
+   local nllfwd = a:time().real
+   
+   a:reset()
+   for i=1,nloop do
+      gradOutput = nll:backward(output, target)
+   end
+   sync()
+   local nllbwd = a:time().real
+   
+   a:reset()
+   for i=1,nloop do
+      gradInput = mlp:backward(input, gradOutput)
+   end
+   sync()
+   local mlpbwd = a:time().real
+   
+   local ncetotal = ncefwd+critfwd+critbwd+ncebwd
+   local lintotal = mlpfwd+nllfwd+nllbwd+mlpbwd
+   print("module:forward (nce vs linear)", ncefwd, mlpfwd)
+   print("criterion:forward (nce vs nll)", critfwd, nllfwd)
+   print("criterion:backward (nce vs nll)", critbwd, nllbwd)
+   print("module:backward (nce vs linear)", ncebwd, mlpbwd)
+   print("total (nce vs linear)", ncetotal, lintotal, lintotal/ncetotal)
+end
+
+function dpnntest.NaN()
+   local _ = require 'moses'
+   local input = torch.randn(2,3)
+   local gradOutput = torch.randn(2,4)
+   local lin = nn.Linear(3,4)
+   lin:zeroGradParameters()
+   local nan = nn.NaN(lin)
+   mytester:assert(nan.id == 1)
+   -- test that it works when no NaNs are present
+   local output = nan:forward(input):clone()
+   local gradInput = nan:backward(input, gradOutput):clone()
+   local gradWeight = lin.gradWeight:clone()
+   local gradBias = lin.gradBias:clone()
+   lin:zeroGradParameters()
+   local output2 = lin:forward(input)
+   local gradInput2 = lin:backward(input, gradOutput)
+   mytester:assertTensorEq(output, output2, 0.000001)
+   mytester:assertTensorEq(gradInput, gradInput2, 0.000001)
+   mytester:assertTensorEq(gradWeight, lin.gradWeight, 0.000001)
+   mytester:assertTensorEq(gradBias, lin.gradBias, 0.000001)
+   -- test with some NaNs
+   input:zero():log():log()
+   local sum = input:sum()
+   mytester:assert(_.isNaN(sum))
+   mytester:assert(not pcall(function() nan:forward(input) end))
+   lin.bias:fill(sum)
+   input = torch.randn(2,3)
+   mytester:assert(not pcall(function() nan:forward(input) end))
+   lin.bias:uniform(0,1)
+   gradOutput:fill(sum)
+   mytester:assert(not pcall(function() nan:backward(input, gradOutput) end))
+   gradOutput:uniform(0,1)
+   lin.gradBias:fill(sum)
+   mytester:assert(not pcall(function() nan:backward(input, gradOutput) end))
 end
 
 function dpnn.test(tests)
